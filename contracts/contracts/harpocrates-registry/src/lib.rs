@@ -50,6 +50,24 @@ const STATUS_POLICY_CANCELLED: u32 = 2;
 const MAX_SIGNERS: u32 = 16;
 const DEFAULT_APPROVAL_TTL_SECS: u64 = 86_400;
 
+// ---------------------------------------------------------------------------
+// Lineage graph bounds (#333)
+// ---------------------------------------------------------------------------
+//
+// A lineage record is a directed edge from registered evidence (or another
+// derivative) to a new derivative. Both directions of every edge are bounded so
+// no single artefact can be amplified into an unbounded family:
+//
+// - `MAX_LINEAGE_FANOUT` caps the parents one derivative may name (in-degree)
+//   and the derivatives one parent may be charged for (out-degree).
+// - `MAX_LINEAGE_DEPTH` caps how far a derivative may sit from the evidence it
+//   descends from. Depth is derived from the parents, never taken from the
+//   caller, so the bound cannot be bypassed by asserting a smaller number.
+// - `MAX_LINEAGE_PAYLOAD_BYTES` caps the encoded lineage payload a registered
+//   edge stands for. The registry only ever sees 32-byte digests, so the bound
+//   it can check is the parent set; the compile-time assertion below keeps the
+//   two bounds consistent, and the manifest body bound is enforced by the
+//   backend that owns the manifest.
 const MAX_LINEAGE_DEPTH: u32 = 4;
 const MAX_LINEAGE_FANOUT: u32 = 4;
 const MAX_LINEAGE_PAYLOAD_BYTES: u32 = 4096;
@@ -80,6 +98,12 @@ pub const TIMESTAMP_ASSURANCE_NONE: u32 = 0;
 pub const TIMESTAMP_ASSURANCE_CLAIMED: u32 = 1;
 pub const TIMESTAMP_ASSURANCE_OBSERVED: u32 = 2;
 pub const TIMESTAMP_ASSURANCE_INDEPENDENT: u32 = 3;
+
+/// A parent set that fits the fan-out cap must also fit the payload budget.
+const _: () = assert!(
+    (MAX_LINEAGE_FANOUT as usize) * 32 <= MAX_LINEAGE_PAYLOAD_BYTES as usize,
+    "MAX_LINEAGE_FANOUT parent digests must fit inside MAX_LINEAGE_PAYLOAD_BYTES"
+);
 
 // ---------------------------------------------------------------------------
 // On-chain metadata envelope versioning (#317)
@@ -3351,14 +3375,26 @@ impl HarpocratesRegistry {
         env.storage().persistent().get(&DataKey::Issuer(issuer))
     }
 
-    /// Register a verifiable derivative lineage edge and persist parent
-    /// content commitments for privacy-preserving public boundaries (#332).
+    /// Record a verifiable derivative of one or more existing artefacts, and
+    /// persist the parent content commitments for privacy-preserving public
+    /// boundaries (#332, #333).
     ///
-    /// Parent commitments are derived on-chain from each parent's stored
-    /// public fields so callers cannot supply forged bindings. Failure modes
-    /// (empty parents, unknown/revoked/expired parents, cycles, depth/fan-out
-    /// overflow, duplicate output) panic with stable `RegistryError` codes and
-    /// never log media, secrets, or witness material.
+    /// Parent commitments are derived on-chain from each parent's stored public
+    /// fields so callers cannot supply forged bindings. `depth` is the depth the
+    /// caller believes this derivative sits at: it is checked against the depth
+    /// implied by the parents rather than trusted, so a caller cannot claim a
+    /// shallow position to slip past `MAX_LINEAGE_DEPTH`; the stored record and
+    /// the published event always carry the derived depth.
+    ///
+    /// Fails with `LineageFanOutExceeded` (#60) when the parent set exceeds
+    /// `MAX_LINEAGE_FANOUT`, `LineageFanOutSaturated` (#79) when a parent
+    /// already has `MAX_LINEAGE_FANOUT` derivatives, `LineageCycle` (#58) for a
+    /// self-referential edge, `LineageTooDeep` (#59) past `MAX_LINEAGE_DEPTH`,
+    /// `LineageDepthMismatch` (#80) for a forged depth, `DuplicateLineage` (#78)
+    /// for an output digest that is already recorded, `LineageEmptyParents`
+    /// (#76) for an empty parent set, `LineageParentUnavailable` (#77) for a
+    /// revoked or expired proof parent, and `InvalidLineage` (#57) for a
+    /// duplicated or unknown parent set.
     pub fn register_lineage(
         env: Env,
         actor: Address,
@@ -3369,8 +3405,10 @@ impl HarpocratesRegistry {
         depth: u32,
     ) -> LineageRecord {
         actor.require_auth();
-        validate_lineage(&env, &parent_proof_ids, &output_digest, depth);
 
+        // A lineage record is immutable evidence. Re-registering an output
+        // digest would let any caller overwrite a recorded derivation and spend
+        // a parent's fan-out budget without producing a new derivative.
         if env
             .storage()
             .persistent()
@@ -3388,7 +3426,7 @@ impl HarpocratesRegistry {
             actor: actor.clone(),
             operation_type: operation_type.clone(),
             output_digest: output_digest.clone(),
-            depth,
+            depth: derived_depth,
         };
         env.storage()
             .persistent()
@@ -3399,7 +3437,7 @@ impl HarpocratesRegistry {
             manifest_digest: manifest_digest.clone(),
             actor: actor.clone(),
             operation_type: operation_type.clone(),
-            depth,
+            depth: derived_depth,
             parent_commitments,
         }
         .publish(&env);
@@ -4895,6 +4933,31 @@ fn compute_timestamp_assurance(sources: u32) -> u32 {
 /// self-reference, and every parent must already be a usable proof or lineage
 /// record (proofs must not be revoked/expired).
 
+/// Derivatives already recorded against `parent` (#333).
+fn lineage_child_count(env: &Env, parent: &BytesN<32>) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::LineageChildCount(parent.clone()))
+        .unwrap_or(0u32)
+}
+
+/// Validate a lineage edge set and return the depth it implies (#333).
+///
+/// Every bound is checked before anything is written, so a rejected edge never
+/// leaves a parent charged for a derivative that was not recorded:
+///
+/// - The parent set is non-empty (`LineageEmptyParents`), at most
+///   `MAX_LINEAGE_FANOUT` long (in-degree), and contains no repeated digest, so
+///   the cap counts distinct edges rather than duplicate entries.
+/// - The output digest is not one of its own parents, and every parent is
+///   already a known proof or lineage record, so an edge can only ever point at
+///   evidence that exists. A proof parent must still be usable: a revoked or
+///   expired proof cannot anchor a derivative (`LineageParentUnavailable`).
+/// - The depth derived from the parents is within `MAX_LINEAGE_DEPTH` and equal
+///   to `claimed_depth`, so a caller cannot claim a shallow position to slip
+///   past the cap (`LineageDepthMismatch`).
+/// - Every parent still has out-degree budget left under `MAX_LINEAGE_FANOUT`
+///   (`LineageFanOutSaturated`).
 fn require_supported_metadata_envelope_version(env: &Env, version: u32) {
     if version < METADATA_ENVELOPE_V1 || version > METADATA_ENVELOPE_VERSION_MAX {
         panic_with_error!(env, RegistryError::UnsupportedMetadataEnvelopeVersion);
@@ -4955,27 +5018,26 @@ fn stamp_default_metadata_envelope(env: &Env, proof_id: &BytesN<32>, metadata_ha
     }
     .publish(env);
 }
-
 fn validate_lineage(
     env: &Env,
     parent_proof_ids: &Vec<BytesN<32>>,
     output_digest: &BytesN<32>,
-    depth: u32,
-) {
-    if parent_proof_ids.len() == 0 {
+    claimed_depth: u32,
+) -> u32 {
+    let parent_count = parent_proof_ids.len();
+
+    // A derivative with no parents is a registration, not a lineage edge.
+    if parent_count == 0 {
         panic_with_error!(env, RegistryError::LineageEmptyParents);
     }
-    if parent_proof_ids.len() > MAX_LINEAGE_FANOUT as u32 {
+    if parent_count > MAX_LINEAGE_FANOUT {
         panic_with_error!(env, RegistryError::LineageFanOutExceeded);
     }
-    if depth > MAX_LINEAGE_DEPTH {
-        panic_with_error!(env, RegistryError::LineageTooDeep);
-    }
-    if depth == 0 {
-        panic_with_error!(env, RegistryError::InvalidLineage);
-    }
 
-    for parent in parent_proof_ids.iter() {
+    let mut max_parent_depth: u32 = 0;
+    for cursor in 0..parent_count {
+        let parent = parent_proof_ids.get(cursor).unwrap();
+
         if parent == *output_digest {
             panic_with_error!(env, RegistryError::LineageCycle);
         }
@@ -4999,6 +5061,29 @@ fn validate_lineage(
         }
         panic_with_error!(env, RegistryError::InvalidLineage);
     }
+
+    let derived_depth = max_parent_depth.saturating_add(1);
+    if derived_depth > MAX_LINEAGE_DEPTH {
+        panic_with_error!(env, RegistryError::LineageTooDeep);
+    }
+    if claimed_depth != derived_depth {
+        panic_with_error!(env, RegistryError::LineageDepthMismatch);
+    }
+
+    // Charge every parent's out-degree budget. Budgets are read before any is
+    // written so a saturated parent cannot leave the earlier parents charged.
+    for parent in parent_proof_ids.iter() {
+        if lineage_child_count(env, &parent) >= MAX_LINEAGE_FANOUT {
+            panic_with_error!(env, RegistryError::LineageFanOutSaturated);
+        }
+    }
+    for parent in parent_proof_ids.iter() {
+        let key = DataKey::LineageChildCount(parent.clone());
+        let used = lineage_child_count(env, &parent);
+        env.storage().persistent().set(&key, &(used + 1));
+    }
+
+    derived_depth
 }
 
 /// Derive the domain-separated parent content commitment (#332).
