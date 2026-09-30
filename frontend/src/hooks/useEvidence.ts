@@ -10,7 +10,7 @@
  * material (see docs/proof-worker.md).
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Building2, Fingerprint, KeyRound } from 'lucide-react'
 import type { IdentityTier, ProofPackage, SilentWitnessProof, Stage } from '../types'
 import type { RegisterProofResult } from '../stellarTypes'
@@ -399,7 +399,8 @@ export function useEvidence(): UseEvidenceReturn {
     }
 
     setStage('proving')
-    setMessage('Generating Noir UltraHonk proof in a cancellable browser worker.')
+    setProofStage(null)
+    setMessage('Generating Noir UltraHonk proof in this browser.')
 
     const { fieldSecret } = await import('../utils')
     throwIfAborted(signal)

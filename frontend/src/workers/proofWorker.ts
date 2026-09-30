@@ -4,8 +4,6 @@ import { CircuitInputError } from '../circuitInputSchema'
 import type { WorkerRequest, WorkerResponse, TransferableProofInput } from './proofWorker.types'
 
 let activeRequestId: string | null = null
-/** Cooperative cancel flag — terminate() is still the hard stop from the client. */
-let cancelRequestedFor: string | null = null
 
 function post(msg: WorkerResponse) {
   ;(self as unknown as Worker).postMessage(msg)
@@ -16,26 +14,14 @@ function bufToStr(buf: ArrayBuffer): string {
 }
 
 function zero(buf: ArrayBuffer) {
-  try {
-    new Uint8Array(buf).fill(0)
-  } catch {
-    // Detached / already transferred buffers must not throw into the host.
-  }
-}
-
-function zeroInput(input: TransferableProofInput) {
-  zero(input.credentialSecret)
-  zero(input.nullifierSecret)
+  new Uint8Array(buf).fill(0)
 }
 
 async function handleGenerate(requestId: string, input: TransferableProofInput) {
   if (activeRequestId !== null) {
-    // Privacy: never leave transferred secret buffers live on the BUSY path.
-    zeroInput(input)
     post({ type: 'ERROR', requestId, code: 'BUSY', message: 'A proof is already being generated.' })
     return
   }
-
   activeRequestId = requestId
   cancelRequestedFor = null
 
@@ -64,12 +50,6 @@ async function handleGenerate(requestId: string, input: TransferableProofInput) 
       verifierScope: input.verifierScope,
       epoch: input.epoch,
     })
-
-    if (cancelRequestedFor === requestId) {
-      post({ type: 'CANCELLED', requestId })
-      return
-    }
-
     post({ type: 'RESULT', requestId, proof })
   } catch (err) {
     if (cancelRequestedFor === requestId) {
@@ -104,25 +84,13 @@ async function handleGenerate(requestId: string, input: TransferableProofInput) 
   }
 }
 
-function handleCancel(requestId: string) {
-  if (activeRequestId !== requestId) {
-    // Stale or unknown cancel — acknowledge so the client can settle cleanly.
-    post({ type: 'CANCELLED', requestId })
-    return
-  }
-  cancelRequestedFor = requestId
-  // UltraHonk cannot be interrupted mid-flight; the main thread will terminate
-  // this worker. Mark cancelled so a rare cooperative path still settles safely.
-  post({ type: 'CANCELLED', requestId })
-}
-
 self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   const msg = event.data
   if (msg.type === 'GENERATE_PROOF') {
     void handleGenerate(msg.requestId, msg.input)
-  } else if (msg.type === 'CANCEL') {
-    handleCancel(msg.requestId)
   }
+  // CANCEL is handled by the main thread terminating this worker outright —
+  // no in-worker cancel logic needed since generateProof can't be interrupted mid-flight.
 }
 
 post({ type: 'READY' })
