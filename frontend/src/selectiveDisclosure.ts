@@ -1,4 +1,4 @@
-import { Barretenberg, UltraHonkBackend } from '@aztec/bb.js'
+import { Barretenberg, Fr, UltraHonkBackend } from '@aztec/bb.js'
 import { Noir } from '@noir-lang/noir_js'
 import type { CompiledCircuit } from '@noir-lang/types'
 import type {
@@ -7,6 +7,7 @@ import type {
   SelectiveDisclosureProof,
 } from './types/schema'
 import { SCHEMA_CONSTANTS } from './types/schema'
+import { encodePublicInputs } from './verifierInputs'
 
 let circuitPromise: Promise<CompiledCircuit> | null = null
 let bbPromise: Promise<Barretenberg> | null = null
@@ -18,8 +19,8 @@ async function getBB(): Promise<Barretenberg> {
 
 async function pedersenHash(inputs: bigint[]): Promise<bigint> {
   const bb = await getBB()
-  const result = await bb.pedersenHash(inputs)
-  return result
+  const result = await bb.pedersenHash(inputs.map((input) => new Fr(input)), 0)
+  return BigInt(result.toString())
 }
 
 function padPredicates(predicates: Predicate[]): Predicate[] {
@@ -47,13 +48,13 @@ function padArray<T>(arr: T[], len: number, fill: T): T[] {
 }
 
 async function computePredicateCommitment(predicates: Predicate[]): Promise<string> {
-  const padded = padPredicates(predicates)
+  // The circuit hashes exactly num_predicates entries and skips the padding
+  // predicates, so the commitment must only fold real predicates.
   let current = BigInt(0)
-  for (let i = 0; i < padded.length; i++) {
-    const p = padded[i]
+  for (const p of predicates) {
     const predType = BigInt(p.predicateType === 'Equality' ? 0 : p.predicateType === 'SetMembership' ? 1 : 2)
-    const attrIndex = BigInt(i < predicates.length ? p.attrIndex : 0)
-    const publicValue = BigInt(i < predicates.length ? (p.publicValue ?? '0') : '0')
+    const attrIndex = BigInt(p.attrIndex ?? 0)
+    const publicValue = BigInt(p.publicValue ?? '0')
     current = await pedersenHash([current, predType, attrIndex, publicValue])
   }
   return current.toString()
@@ -121,7 +122,7 @@ export async function generateSelectiveDisclosureProof(
   try {
     const proofData = await backend.generateProof(witness, { keccak: true })
     const proofHex = bytesToHex(proofData.proof)
-    const publicInputHex = proofData.publicInputs.map(fieldToBytes32Hex).join('')
+    const publicInputHex = encodePublicInputs(proofData.publicInputs)
 
     return {
       proof: proofHex,
@@ -143,14 +144,6 @@ async function fetchCircuit(path: string) {
     throw new Error(`Unable to load Noir circuit artifact: ${path}`)
   }
   return (await response.json()) as CompiledCircuit
-}
-
-function fieldToBytes32Hex(value: string) {
-  const normalized = value.startsWith('0x') ? value.slice(2) : BigInt(value).toString(16)
-  if (normalized.length > 64) {
-    throw new Error('Noir field is larger than 32 bytes.')
-  }
-  return normalized.padStart(64, '0')
 }
 
 function bytesToHex(bytes: Uint8Array) {

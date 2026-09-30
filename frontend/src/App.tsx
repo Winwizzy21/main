@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Wallet } from 'lucide-react'
 import EvilEye from './components/EvilEye'
 import BatchVerificationWorkspace from './components/BatchVerificationWorkspace'
@@ -14,6 +14,7 @@ import type { View } from './types'
 import { createProofManifest } from './proofManifest'
 import { CONTRACT_NETWORK_PASSPHRASE } from './stellar'
 import { buildProvenanceRecord } from './provenance/provenanceModel'
+import { parseVerificationShareLink, type VerificationSharePayload } from './verificationShareLink'
 import './App.css'
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:5050'
@@ -30,20 +31,33 @@ function methodForTier(tier: IdentityTier) {
 
 function initialView(): AppView {
   const hash = window.location.hash.replace('#', '')
-  return hash === 'studio' || hash === 'verify' || hash === 'batch' ? hash : 'landing'
+  const view = hash.split('?')[0]
+  return view === 'studio' || view === 'verify' || view === 'batch' ? view : 'landing'
+}
+
+function initialSharePayload(): VerificationSharePayload | null {
+  const parsed = parseVerificationShareLink(window.location.href)
+  return parsed.ok ? parsed.payload : null
 }
 
 function App() {
   const [currentView, setCurrentView] = useState<AppView>(initialView)
+  const [sharePayload] = useState<VerificationSharePayload | null>(initialSharePayload)
   const [isScrolled, setIsScrolled] = useState(false)
 
-  const { wallet, connectWallet } = useWallet()
+  const { wallet, networkMismatch: walletNetworkMismatch, connectWallet } = useWallet()
   const evidence = useEvidence()
   const verification = useVerification()
 
+  useEffect(() => {
+    if (!sharePayload) return
+    setCurrentView('verify')
+    void verification.loadSharedVerification(sharePayload)
+  }, [sharePayload, verification.loadSharedVerification])
+
   const liveStatus = useLiveRegion()
   const liveAlert = useLiveRegion()
-  const { statusLabel, isBusy } = useA11yStage(evidence.stage)
+  const { statusLabel } = useA11yStage(evidence.stage)
   const { mainRef, handleSkip } = useSkipLink()
 
   const prevStageRef = useRef(evidence.stage)
@@ -56,7 +70,7 @@ function App() {
     } else if (evidence.stage !== 'idle') {
       liveStatus.announce(statusLabel)
     }
-  }, [evidence.stage, evidence.message, statusLabel])
+  }, [evidence.stage, evidence.message, statusLabel, liveAlert, liveStatus])
 
   const viewHeadingId = currentView === 'studio'
     ? 'studio-heading'
@@ -102,6 +116,7 @@ function App() {
   }, [])
 
   function openView(view: AppView) {
+    if (view !== currentView) evidence.cancelProving()
     setCurrentView(view)
     const nextHash = view === 'landing' ? window.location.pathname : `${window.location.pathname}#${view}`
     window.history.replaceState(null, '', nextHash)
@@ -142,7 +157,7 @@ function App() {
           <button className="brand" type="button" onClick={() => openView('landing')} title="Home">
             Harpocrates
           </button>
-          <div className="navlinks" aria-label="Primary">
+          <div className="navlinks" role="group" aria-label="Primary">
             <button
               className={currentView === 'studio' ? 'active' : ''}
               aria-current={currentView === 'studio' ? 'page' : undefined}
@@ -169,11 +184,30 @@ function App() {
             </button>
           </div>
           <div className="network-pill">Stellar Testnet</div>
-          <button className="icon-button" type="button" onClick={() => void connectWallet().catch(() => {})} title="Connect wallet">
+          <button
+            className={`icon-button${walletNetworkMismatch ? ' wallet-mismatch' : ''}`}
+            type="button"
+            onClick={() => void connectWallet().catch(() => {})}
+            title={walletNetworkMismatch ? 'Wallet network mismatch — click to reconnect' : 'Connect wallet'}
+            aria-describedby={walletNetworkMismatch ? 'navbar-network-mismatch' : undefined}
+          >
             <Wallet size={18} aria-hidden="true" />
             <span>{wallet ? `${wallet.slice(0, 5)}...${wallet.slice(-4)}` : 'Connect'}</span>
           </button>
         </nav>
+
+        {walletNetworkMismatch ? (
+          <div
+            id="navbar-network-mismatch"
+            className="network-mismatch-banner network-mismatch-banner--global"
+            role="alert"
+            aria-live="assertive"
+            aria-atomic="true"
+          >
+            <span className="network-mismatch-icon" aria-hidden="true">⚠</span>
+            <span>{walletNetworkMismatch}</span>
+          </div>
+        ) : null}
 
         {currentView === 'landing' ? (
           <LandingView onOpenStudio={() => openView('studio')} onOpenVerify={() => openView('verify')} />
@@ -189,7 +223,7 @@ function App() {
         ) : null}
 
         {currentView === 'verify' ? (
-          <VerifyView wallet={wallet} verification={verification} provenanceRecord={provenanceRecord} />
+          <VerifyView wallet={wallet} networkMismatch={walletNetworkMismatch} verification={verification} provenanceRecord={provenanceRecord} />
         ) : null}
 
         {currentView === 'batch' ? (

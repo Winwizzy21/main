@@ -21,6 +21,72 @@ cargo test
 stellar contract build
 ```
 
+## Contract Wasm Size Budget
+
+Issue #346 adds a fail-closed size budget for the deployed registry artifact
+`harpocrates_registry.wasm` so supply-chain accidents (an unintended
+dependency, a disabled optimization, a truncated artifact) fail CI before
+they can be deployed.
+
+- Constants live in `contracts/harpocrates-registry/src/wasm_budget.rs`:
+  `MAX_WASM_SIZE_BYTES = 128_000` (just under Soroban's 128 KiB upload cap),
+  `MIN_WASM_SIZE_BYTES = 10_000`,
+  `WASM_SIZE_REGRESSION_BAND_PCT = 15`, plus a typed `WasmBudgetError`
+  contract (`ArtifactTooLarge`, `ArtifactTooSmall`, `MissingArtifact`).
+- The budget manifest is `devx/wasm_size_budget.json`; the fail-closed gate
+  is `devx/wasm_size_budget.py` and runs in the Contracts CI workflow after
+  `stellar contract build`.
+- The gate fails closed: a missing artifact, malformed manifest, size
+  outside the `[min, max]` band, or drift beyond `regression_band_pct` from
+  the recorded baseline all fail. Diagnostics carry sizes and digests only —
+  never artifact bytes, proofs, witnesses, media, or keys.
+
+```bash
+# check the built artifact against the budget
+python3 devx/wasm_size_budget.py --check
+
+# deliberately migrate the baseline after a reviewed size change
+python3 devx/wasm_size_budget.py --record
+
+cd contracts/contracts/harpocrates-registry
+make wasm-budget
+```
+
+The module is host-side only (`#[cfg(not(target_arch = "wasm32"))]`), so the
+deployed artifact stays byte-identical to the pre-budget build, and no
+exported contract function, storage key, or event schema changes. The
+recorded baseline also pins the artifact's SHA-256 digest as an audit trail
+for the deployed build. Rollback is reverting the gate step, the manifest,
+and the budget module; no on-chain repair is required.
+
+## Identity-Tier Property Tests
+
+Issue #345 adds focused property tests for identity-tier invariants in
+`contracts/harpocrates-registry/src/test_identity_tier_properties.rs`.
+
+The harness uses a deterministic LCG over reproducible seeds to generate
+registration sequences across Silent Witness (tier 1), Consistent Source
+(tier 2), and Public Seal (tier 3). After every step it checks:
+
+- tier-shaped privacy fields (no source/issuer on tier 1; nullifier only on tier 1)
+- global uniqueness of `proof_id` and `video_hash` across tiers
+- nullifier uniqueness for Silent Witness registrations
+- pause-domain isolation (pausing one tier never blocks the others)
+- lookup consistency (`get_proof` / `get_by_video`)
+- rejected duplicates leave prior storage unchanged
+
+Failure messages report only seeds, tier tags, slot indices, and error codes —
+never proof bytes, public inputs, witnesses, or media.
+
+Run focused:
+
+```
+cargo test -p harpocrates-registry identity_tier -- --nocapture
+```
+
+This change is test-only. It does not alter exported contract entry points,
+storage keys, or on-chain migration behavior.
+
 ## Registry State-Machine Fuzzing
 
 Issue #93 adds deterministic state-machine fuzzing for the registry contract in
@@ -63,6 +129,48 @@ simplification, then prints the original seed, the failing step, the shrunk
 command list, and the expected/actual error code. It never prints proof bytes,
 public input bytes, witnesses, media, credentials, signatures, or raw metadata.
 The model uses deterministic slot numbers and synthetic hashes only.
+
+## Upgrade Compatibility Harness
+
+Issue #347 adds a focused upgrade compatibility harness in
+`contracts/harpocrates-registry/src/test_upgrade_compat.rs`. It drives the
+real `upgrade_storage` / `get_storage_schema_version` boundary with:
+
+- positive V1 init + idempotent upgrade calls
+- negative unauthorized upgrade attempts
+- legacy registries missing `DataKey::SchemaVersion` (stamp without event)
+- regression that Tier-2 source proofs and the verifier pointer survive upgrade
+
+```bash
+cd contracts
+cargo test -p harpocrates-registry upgrade_compat -- --nocapture
+```
+
+### Compatibility, Migration, And Rollback
+
+`upgrade_storage` is the only admin path that advances `DataKey::SchemaVersion`.
+At V1 the call is a no-op when the key is already present. Pre-#85 deployments
+that lack the key are stamped to V1 without emitting `SchemaUpgraded` because
+the on-disk layout is already V1-compatible. Future V2+ migrations must land
+in the sequential branch inside `upgrade_storage`, preserve existing proof /
+video / nullifier records, and must never log media, secrets, witnesses, or
+private keys.
+
+A V1 wasm presented with a stored version greater than V1 leaves that version
+and the rest of storage untouched; it does not attempt a downgrade. Operators
+must use a wasm that supports the stored schema version.
+
+Rollback is redeploying a prior wasm: additive `SchemaVersion` keys are
+ignored by older readers, and no proof rewrite is required for the V1 stamp.
+Operators should call `get_storage_schema_version` after upgrade to confirm
+the stamped version before rotating verifiers.
+
+### Threat Assumptions
+
+The harness assumes Soroban auth + persistent storage semantics. It does not
+exercise live mainnet wasm replace, cryptographic verifier soundness, or real
+evidence payloads. Failure modes under test are deterministic `RegistryError`
+codes (`Unauthorized`) and privacy-safe absence of `SchemaUpgraded` on no-ops.
 
 ### Compatibility And Rollout
 
@@ -121,6 +229,8 @@ The current registry exports:
 
 ```text
 init
+get_storage_schema_version
+upgrade_storage
 propose_admin
 cancel_admin_transfer
 accept_admin
@@ -145,6 +255,10 @@ get_proof
 get_by_video
 has_nullifier
 get_issuer
+rotate_issuer
+finalize_issuer_rotation
+get_issuer_rotation
+is_issuer_verifiable
 set_revocation_root
 get_revocation_root
 check_non_revocation
@@ -152,6 +266,13 @@ get_proof_status
 get_proof_history
 get_proof_history_at
 get_proof_history_count
+open_dispute
+respond_dispute
+resolve_dispute
+dismiss_dispute
+supersede_dispute
+get_dispute
+get_open_dispute_count
 verify_proof
 expire_proof
 correct_proof
@@ -265,11 +386,34 @@ verify_proof(public_inputs, proof)
 
 See `VERIFIER_INTEGRATION.md` for the UltraHonk verifier deployment plan.
 
+The verifier's verdict is enforced: `verify_external_proof` returning `false`
+fails the registration with `InvalidProof` (`#7`).
+
 Current Testnet verifier:
 
 ```text
 CCP2EQPKT5XAYTOARX3LGHNMJ37A6W2WY3H54MRIHEZVTVAZZPUSGZQJ
 ```
+
+## Receipt Digest Commitment (#337)
+
+A signed verification receipt can be anchored on-chain without storing the
+receipt: the caller commits `sha256(canonical_json(receipt))` together with a
+P-256 attestation from an admin-managed receipt-signing key. The attestation
+signs a 129-byte domain-separated preimage that binds the contract address,
+`proof_id`, and the digest, so a signature cannot be replayed against another
+deployment, proof, or digest. One immutable commitment per proof; retries of
+the same digest are idempotent. Registration pauses do not gate receipt
+commits or signer management.
+
+| Function | Auth |
+|----------|------|
+| `add_receipt_signer` / `revoke_receipt_signer` | admin only (max 8 active keys) |
+| `commit_receipt_digest` | admin, the proof's tier-2 source, or its tier-3 issuer (tier 1: admin only) |
+| `get_receipt_commitment` / `get_receipt_signer` | public |
+
+See `RECEIPT_COMMITMENT.md` for the preimage layout, guard order, errors,
+events, and test-vector provenance.
 
 ## Events
 
@@ -280,6 +424,8 @@ The registry emits typed Soroban events with `#[contractevent]`:
 ["proof", "revoke", proof_id]     => status
 ["issuer", "add", issuer]         => metadata_hash
 ["issuer", "revoke", issuer]      => {}
+["issuer", "rotate", previous_issuer] => replacement_issuer, rotated_at, grace_expires_at, grace_secs
+["issuer", "grace", issuer]       => replacement_issuer, grace_expires_at
 ["verif", "set", verifier]        => {}
 ["credroot", "add", root]         => metadata_hash, issued_at
 ["credroot", "revoke", root]      => {}
@@ -292,8 +438,23 @@ The registry emits typed Soroban events with `#[contractevent]`:
 ["pause", "set", domain]          => paused_by, paused_at, expires_at
 ["pause", "clear", domain]        => unpaused_by, unpaused_at
 ["guardian", "set", guardian]     => {}
-["schema", "upgrade"]              => previous, current
+["dispute", "open", dispute_id]   => proof_id, reason, reporter_hash, commitment_hash, respond_deadline
+["dispute", "respond", dispute_id] => proof_id, response_commitment, resolve_deadline
+["dispute", "resolve", dispute_id] => proof_id, resolved_at
+["dispute", "dismiss", dispute_id] => proof_id, resolved_at
+["dispute", "supersede", dispute_id] => proof_id, superseded_by, resolved_at
+["verif", "schedule"]             => active_verifier, pending_verifier, activation_ledger, overlap_window, rollback_window
+["verif", "activate"]             => active_verifier, previous_verifier, rollback_window_end
+["verif", "rollback"]             => active_verifier, previous_verifier
+["receipt", "commit", proof_id]   => receipt_digest, tier, public_key, committed_at
+["signer", "add", public_key]     => added_at
+["signer", "revoke", public_key]  => revoked_at
 ```
+
+For every successful proof registration, `proof/reg` is emitted before the
+corresponding `proof/history` event. Batch registration emits that same pair
+for each derived proof in input order. Rejected registrations emit neither
+event, so indexers can treat the ordered pair as the registration boundary.
 
 ## Lifecycle History (#90)
 
@@ -350,6 +511,52 @@ All registration functions and `revoke_proof` automatically record history.
 
 Proofs registered before this feature have zero history entries. `get_proof_history`
 returns an empty vector for such proofs. The existing `ProofRecord` schema is unchanged.
+
+## Dispute And Supersession
+
+`open_dispute`, `respond_dispute`, `resolve_dispute`, `dismiss_dispute`,
+`supersede_dispute`, `get_dispute`, and `get_open_dispute_count` add a bounded,
+auditable dispute/correction state machine. Disputes never modify or delete the
+disputed proof and are independent of revocation - a disputed proof can still
+report `Valid` from `get_proof_status`. Reporter identity is stored only as a
+caller-supplied `reporter_hash` commitment, and events carry commitment hashes
+and timestamps only.
+
+Bounds: `MAX_OPEN_DISPUTES_PER_PROOF = 4`, `REPORTER_COOLDOWN_SECS = 86400`,
+`RESPOND_DEADLINE_SECS = 604800`, `RESOLVE_DEADLINE_SECS = 1209600`. All new
+storage keys (`Dispute`, `ProofOpenDisputeCount`, `ReporterCooldown`) are
+additive, so upgrading requires no migration and rollback is a plain wasm
+redeploy.
+
+See [DISPUTE.md](DISPUTE.md) for the state machine, error codes, threat notes,
+and migration/rollback details.
+
+## Contract Error ABI (#344)
+
+`contracts/ERROR_ABI.md` publishes the stable error ABI (`hpx-err/1`) for
+`RegistryError`: every discriminant, its variant name, its failure class
+(`malformed`, `oversized`, `expired`, `revoked`, `unsupported`, `dependency`,
+plus `auth`, `conflict`, `resource`, `state`), and whether the same call may be
+retried once an external condition clears.
+
+Codes `1..=80` are frozen and append-only: a new failure takes the next unused
+number, and an existing code is never renumbered or reused. The ABI describes
+revert values only. It adds no storage keys, changes no entrypoint signature,
+and requires no migration.
+
+Failure responses stay privacy-safe: a revert is reported as a code, never as a
+dump of the offending input. Proof bytes, public inputs, witnesses, nullifiers,
+media, credentials, signatures, and private keys are never part of an error and
+never logged, and a rejected call still emits no lifecycle event.
+
+`contracts/harpocrates-registry/src/test_error_abi.rs` reads the document at
+compile time and fails if a variant is renamed, renumbered, dropped, duplicated,
+or assigned a class outside the documented set:
+
+```bash
+cd contracts
+cargo test -p harpocrates-registry error_abi -- --nocapture
+```
 
 ## Scripts
 

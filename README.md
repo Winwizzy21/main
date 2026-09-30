@@ -36,6 +36,7 @@ DESIGN.md   Visual design source
 | [docs/zk-fuzzing.md](docs/zk-fuzzing.md) | Structured fuzzing of malformed proofs and public inputs |
 | [docs/contract-delegation.md](docs/contract-delegation.md) | Constrained, expiring issuer and source delegation |
 | [docs/streaming-uploads.md](docs/streaming-uploads.md) | Bounded streaming upload path |
+| [docs/release-operations.md](docs/release-operations.md) | Release state machine, SBOM generation, cosign verification, rollback notes |
 | [THREAT_MODEL.md](THREAT_MODEL.md) | Protocol threat model |
 | [SECURITY.md](SECURITY.md) | Vulnerability reporting |
 
@@ -127,6 +128,7 @@ Done:
 - NeonDB proof event storage.
 - Registration event persistence after Stellar submission.
 - Verification portal lookup across embedded metadata, NeonDB, and Soroban `get_by_video`.
+- **Offline local verification mode**: the Verification Portal can verify a received video fully in the browser with zero network calls — local hash, local stego envelope extraction, structural validation mirroring the backend envelope grammar, and file→metadata binding when the envelope carries a video hash. Offline mode is only a local check: it never yields a confirmed trust decision, never produces a shareable verification link, and queries no chain/registry/event source (see [THREAT_MODEL.md](THREAT_MODEL.md) §5 and `frontend/ACCESSIBILITY.md`).
 - Real Noir Silent Witness circuit with UltraHonk proof generation and local verification.
 - Browser-side Noir JS and bb.js prover for user-seeded, video-specific Silent Witness proofs.
 - Soroban registry with all three identity paths.
