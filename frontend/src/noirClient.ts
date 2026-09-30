@@ -316,3 +316,25 @@ async function sha256(input: string): Promise<string> {
   const hash = await crypto.subtle.digest('SHA-256', bytes)
   return bytesToHex(new Uint8Array(hash))
 }
+
+async function loadHelperCircuit() {
+  helperCircuitPromise ??= loadCircuit('/noir/silent_witness_helper.json')
+  return helperCircuitPromise
+}
+
+async function loadMainCircuit() {
+  mainCircuitPromise ??= loadCircuit('/noir/silent_witness.json')
+  return mainCircuitPromise
+}
+
+async function loadCircuit(path: string) {
+  const response = await fetch(path, { cache: 'no-store' })
+  if (!response.ok) {
+    throw new Error(`Unable to load Noir circuit artifact: ${path}`)
+  }
+  return (await response.json()) as CompiledCircuit
+}
+
+function bytesToHex(bytes: Uint8Array) {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+}

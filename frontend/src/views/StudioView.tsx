@@ -41,8 +41,10 @@ export function StudioView({ wallet, evidence, verification, provenanceRecord }:
     message,
     registration,
     networkMismatch,
+    isCancellable,
     handleEvidence,
     registerProof,
+    cancelEvidence,
     cancelProving,
   } = evidence
 
@@ -167,6 +169,20 @@ export function StudioView({ wallet, evidence, verification, provenanceRecord }:
                 autoComplete="off"
               />
             </label>
+          </div>
+        ) : null}
+
+        {isCancellable ? (
+          <div className="verify-actions" role="group" aria-label="Evidence studio actions">
+            <button
+              type="button"
+              className="hero-secondary verify-action-btn"
+              onClick={cancelEvidence}
+              aria-label={stage === 'proving' ? 'Cancel proof generation' : 'Cancel upload'}
+            >
+              <XCircle size={14} aria-hidden="true" />
+              {stage === 'proving' ? 'Cancel proof' : 'Cancel upload'}
+            </button>
           </div>
         ) : null}
 

@@ -340,8 +340,7 @@ describe('structured proof-hex decoding fuzz', () => {
     [MAX_PROOF_BYTES + 1, 'proof_oversize'],
   ] as const)('proof length %i yields %s', (length, expected) => {
     const schema = SCHEMAS[0]
-    const frameHex = toHex(positiveFrames.get(schema)!)
-    expect(classify(schema, frameHex, 'ab'.repeat(length))).toBe(expected)
+    expect(classify(schema, toHex(positiveFrames.get(schema)!), 'ab'.repeat(length))).toBe(expected)
   })
 
   it.each([
@@ -352,8 +351,7 @@ describe('structured proof-hex decoding fuzz', () => {
     [`0x${'ab'.repeat(64)}`, 'malformed_hex'],
   ] as const)('malformed proof hex %j rejects before bounds', (proofHex, expected) => {
     const schema = SCHEMAS[0]
-    const frameHex = toHex(positiveFrames.get(schema)!)
-    expect(classify(schema, frameHex, proofHex)).toBe(expected)
+    expect(classify(schema, toHex(positiveFrames.get(schema)!), proofHex)).toBe(expected)
   })
 
   it.each(SEEDS)('seed=%i proof rejection signals never echo mutant bytes', (seed) => {

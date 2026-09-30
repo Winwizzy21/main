@@ -160,6 +160,18 @@ export type RegistryMethod =
   | 'get_schema'
   | 'get_verifier_state'
 
+export type ProofHistoryEntry = {
+  action: number
+  timestamp: string
+  actor: string | null
+  reasonCode: number
+}
+
+export type ProofHistoryResult = {
+  entries: ProofHistoryEntry[]
+  count: number
+}
+
 export type ScopedProofScope = {
   /** Field element derived from the scope string (SHA-256 mod BN254). */
   scopeField: string
