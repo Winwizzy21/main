@@ -1002,6 +1002,71 @@ pub struct DisputeSuperseded {
     pub resolved_at: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Signed receipt digest commitment (#337)
+// ---------------------------------------------------------------------------
+
+/// Admin-managed receipt-signing key record. `public_key` is a SEC-1
+/// encoded uncompressed P-256 point (`0x04 || X || Y`); public keys are not
+/// secrets, and no private key material is ever stored.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceiptSignerRecord {
+    pub public_key: BytesN<65>,
+    /// False once revoked. Revocation is recorded rather than deleted so an
+    /// operator can distinguish "revoked" from "never registered".
+    pub active: bool,
+    pub added_at: u64,
+    /// 0 while the signer is active.
+    pub revoked_at: u64,
+}
+
+/// Immutable commitment to a signed verification receipt for one proof.
+///
+/// Privacy: every field is a commitment, an address, an identifier, or a
+/// timestamp. No receipt bytes, media, metadata hashes, witness values,
+/// signatures, or private keys are stored.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceiptCommitmentRecord {
+    pub proof_id: BytesN<32>,
+    /// `sha256(canonical_json(signed_verification_receipt))`.
+    pub receipt_digest: BytesN<32>,
+    /// Identity tier of the committed proof at commit time (1, 2, or 3).
+    pub tier: u32,
+    /// The attesting receipt-signing public key.
+    pub public_key: BytesN<65>,
+    /// Address that authorized the commit (proof subject or admin).
+    pub committed_by: Address,
+    pub committed_at: u64,
+}
+
+/// Emitted on the first successful commit for a proof. Idempotent retries
+/// emit nothing, so exactly one `["receipt", "commit"]` exists per proof.
+#[contractevent(topics = ["receipt", "commit"])]
+pub struct ReceiptDigestCommitted {
+    #[topic]
+    pub proof_id: BytesN<32>,
+    pub receipt_digest: BytesN<32>,
+    pub tier: u32,
+    pub public_key: BytesN<65>,
+    pub committed_at: u64,
+}
+
+#[contractevent(topics = ["signer", "add"])]
+pub struct ReceiptSignerAdded {
+    #[topic]
+    pub public_key: BytesN<65>,
+    pub added_at: u64,
+}
+
+#[contractevent(topics = ["signer", "revoke"])]
+pub struct ReceiptSignerRevocation {
+    #[topic]
+    pub public_key: BytesN<65>,
+    pub revoked_at: u64,
+}
+
 /// Schema record for issuer-certified attribute schemas.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4510,7 +4575,6 @@ impl HarpocratesRegistry {
             .get(&DataKey::ProofOpenDisputeCount(proof_id))
             .unwrap_or(0u32)
     }
-}
 
 fn require_admin(env: &Env, candidate: &Address) {
     let admin: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
@@ -4543,6 +4607,79 @@ fn require_pauser(env: &Env, caller: &Address) -> bool {
         Some(g) if &g == caller => false,
         _ => panic_with_error!(env, RegistryError::Unauthorized),
     }
+}
+
+/// Require that `caller` may commit a receipt digest for `record`: either the
+/// registry admin (any tier) or the proof's own tier-2 source / tier-3 issuer.
+/// Tier 1 proofs carry no on-chain identity, so they are admin-only — the
+/// same precedent `respond_dispute` uses for anonymous proofs.
+///
+/// `caller.require_auth()` must already have run; this function only decides
+/// whether the (public) proof record names the caller.
+fn require_receipt_actor(env: &Env, caller: &Address, record: &ProofRecord) {
+    let admin: Address = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Admin)
+        .unwrap_or_else(|| panic_with_error!(env, RegistryError::NotInitialized));
+    if caller == &admin {
+        return;
+    }
+
+    let matches_subject = match record.tier {
+        TIER_CONSISTENT_SOURCE => record.source.as_ref() == Some(caller),
+        TIER_PUBLIC_SEAL => record.issuer.as_ref() == Some(caller),
+        _ => false,
+    };
+    if !matches_subject {
+        panic_with_error!(env, RegistryError::Unauthorized);
+    }
+}
+
+/// Number of currently active receipt-signing keys.
+fn receipt_signer_count(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::ReceiptSignerCount)
+        .unwrap_or(0u32)
+}
+
+/// Domain-separated digest a receipt signer must sign for
+/// `commit_receipt_digest` to accept a commitment.
+///
+/// Preimage layout (129 bytes, see `RECEIPT_ATTEST_PREIMAGE_LEN`):
+///
+/// ```text
+/// [  0.. 29)  RECEIPT_ATTEST_DOMAIN  "harpocrates:receipt-digest:v1"
+/// [ 29.. 65)  XDR of the calling contract's address
+///             (4-byte big-endian discriminant 1 || 32-byte contract id)
+/// [ 65.. 97)  proof_id
+/// [ 97..129)  receipt_digest
+/// ```
+///
+/// Binding the contract address keeps an attestation issued for one
+/// deployment from being replayed against another registry that happens to
+/// register the same signer key.
+fn receipt_attestation_digest(
+    env: &Env,
+    proof_id: &BytesN<32>,
+    receipt_digest: &BytesN<32>,
+) -> Hash<32> {
+    let mut preimage = Bytes::new(env);
+    preimage.extend_from_slice(&RECEIPT_ATTEST_DOMAIN);
+    // `to_xdr` serializes an Address as an ScVal: a 4-byte ScVal type tag
+    // followed by the ScAddress XDR (4-byte discriminant 1 || 32-byte
+    // contract id) that the attestation binds to. Keep only the ScAddress arm.
+    let contract_xdr = env.current_contract_address().to_xdr(env);
+    preimage.append(&contract_xdr.slice(4..40));
+    preimage.extend_from_slice(&proof_id.to_array());
+    preimage.extend_from_slice(&receipt_digest.to_array());
+
+    if preimage.len() != RECEIPT_ATTEST_PREIMAGE_LEN {
+        panic_with_error!(env, RegistryError::InvalidPublicInputs);
+    }
+
+    env.crypto().sha256(&preimage)
 }
 
 /// Reject `scope` unless it is nonzero and composed only of known
@@ -5981,6 +6118,8 @@ mod test_issuer_rotation;
 mod test_lineage;
 #[cfg(test)]
 mod test_metadata_envelope;
+#[cfg(test)]
+mod test_invariants;
 #[cfg(test)]
 mod test_pause;
 #[cfg(test)]
