@@ -48,13 +48,13 @@ function padArray<T>(arr: T[], len: number, fill: T): T[] {
 }
 
 async function computePredicateCommitment(predicates: Predicate[]): Promise<string> {
-  const padded = padPredicates(predicates)
+  // The circuit hashes exactly num_predicates entries and skips the padding
+  // predicates, so the commitment must only fold real predicates.
   let current = BigInt(0)
-  for (let i = 0; i < padded.length; i++) {
-    const p = padded[i]
+  for (const p of predicates) {
     const predType = BigInt(p.predicateType === 'Equality' ? 0 : p.predicateType === 'SetMembership' ? 1 : 2)
-    const attrIndex = BigInt(i < predicates.length ? p.attrIndex : 0)
-    const publicValue = BigInt(i < predicates.length ? (p.publicValue ?? '0') : '0')
+    const attrIndex = BigInt(p.attrIndex ?? 0)
+    const publicValue = BigInt(p.publicValue ?? '0')
     current = await pedersenHash([current, predType, attrIndex, publicValue])
   }
   return current.toString()

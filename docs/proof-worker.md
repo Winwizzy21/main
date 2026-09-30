@@ -1,4 +1,4 @@
-# Cancellable Proof Generation Worker
+# Proof Generation Worker and Non-Worker Fallback
 
 ## Overview
 
@@ -7,9 +7,15 @@ runs inside a dedicated Web Worker instead of the main thread. This keeps the
 UI responsive during proving and allows in-flight proof generation to be
 cancelled deterministically and privacy-safely.
 
+When the Web Worker API is unavailable (e.g. `Worker` is not constructible in
+a given environment, or spawning fails), `ProofWorkerClient` falls back to
+proving directly on the main thread with **explicit, configurable limits**
+so a mis-set environment cannot turn the fallback into an unbounded main
+thread hang or unbounded memory use.
+
 Implementation:
 - `src/workers/proofWorker.ts` — runs inside the worker, wraps `noirClient.ts`
-- `src/workers/proofWorker.types.ts` — shared message/state types
+- `src/workers/proofWorker.types.ts` — shared message/state/runtime types
 - `src/workers/proofWorkerClient.ts` — main-thread client (`ProofWorkerClient`)
 - `src/proofWorkerMemory.ts` — worker memory and artifact-size budget checks
 - `src/hooks/useEvidence.ts` — Evidence Studio integration + Cancel button
@@ -44,8 +50,8 @@ Implementation:
 
 ## State machine
 
-Each `ProofWorkerClient` instance holds a single Web Worker and dispatches
-at most one active proof request at a time.
+Each `ProofWorkerClient` instance dispatches at most one active proof
+request at a time, on either runtime.
 
 ```
 idle --generate()--> running --resolves/rejects--> idle
@@ -93,7 +99,7 @@ worker so they cannot settle a newer request.
 
 ## Local verification
 
-Run the worker's automated tests:
+Run the worker/fallback automated tests:
 
 ```bash
 cd frontend
@@ -106,7 +112,7 @@ app), open the dev server in a browser tab, open DevTools console, and run:
 ```js
 const mod = await import('/src/workers/proofWorkerClient.ts')
 const client = new mod.ProofWorkerClient()
-const { requestId, result } = client.generate(
+const { requestId, result, mode, fallbackReason } = client.generate(
   { videoHash: '0'.repeat(64), credentialSecret: '123456789', nullifierSecret: '987654321' },
   (stage) => console.log('progress:', stage),
 )
@@ -164,8 +170,11 @@ invoked.
 
 - Only one proof request is served per `ProofWorkerClient` instance at a
   time; concurrent requests are rejected with `BUSY` rather than queued.
-- Cancellation and timeout both discard in-flight worker state entirely
-  (via `terminate()`); there is no partial-result recovery.
+- Cancellation and timeout on the worker path discard in-flight worker state
+  entirely (via `terminate()`); there is no partial-result recovery.
+- On the main-thread fallback, cancellation/timeout cannot stop the WASM
+  prover already in flight; the slot remains busy (rejecting `BUSY`) until
+  the underlying prover settles.
 - The `@vitest/web-worker` test-environment mock does not fully replicate
   real browser `Worker.terminate()` semantics — an in-flight `fetch` inside a
   terminated worker may still resolve/reject in the mock after termination,

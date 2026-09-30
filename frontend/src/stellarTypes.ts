@@ -155,7 +155,6 @@ export type RegistryMethod =
   | 'get_proof_history_count'
   | 'set_scope_epoch'
   | 'get_scope_epoch'
-  | 'verify_selective_disclosure'
   | 'add_schema'
   | 'get_schema'
   | 'get_verifier_state'
@@ -164,6 +163,22 @@ export type ProofHistoryEntry = {
   action: number
   timestamp: string
   actor: string | null
+  reasonCode: number
+}
+
+export type ProofHistoryResult = {
+  entries: ProofHistoryEntry[]
+  count: number
+}
+
+export type ProofHistoryEntry = {
+  /** Registry action code (see the contract's HistoryAction enum). */
+  action: number
+  /** Ledger sequence / timestamp captured at the time of the action. */
+  timestamp: string
+  /** Actor address that triggered the action, if recorded. */
+  actor: string | null
+  /** Reason code attached to the action. */
   reasonCode: number
 }
 
